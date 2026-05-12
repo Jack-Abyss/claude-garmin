@@ -1,0 +1,16 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+*.bak
+.coverage
+.DS_Store
+
+# Local scan/test scratch files
+_scan_*.py
+_scan_*.ps1

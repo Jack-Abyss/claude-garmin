@@ -1,0 +1,4 @@
+mcp>=1.2,<2
+garminconnect>=0.2.20,<1
+curl_cffi>=0.7,<1
+python-dotenv>=1.0,<2
