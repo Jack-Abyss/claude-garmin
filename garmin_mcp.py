@@ -930,6 +930,841 @@ def get_personal_records() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Helpers: workout step normalization
+# ---------------------------------------------------------------------------
+
+def _mps_to_pace(mps: float) -> str:
+    """Convert m/s to a min:sec/km pace string."""
+    secs = 1000.0 / mps
+    return f"{int(secs // 60)}:{int(secs % 60):02d} /km"
+
+
+def _pace_str(v: Any) -> str | None:
+    """Convert a speed/pace value to a human-readable min:sec/km string.
+
+    Garmin uses m/s in some endpoints (values 2–6) and sec/m in others
+    (values 0.1–0.5). Detect by range and convert accordingly.
+    """
+    if not isinstance(v, (int, float)) or v <= 0:
+        return None
+    if v < 1.0:
+        secs_per_km = v * 1000        # sec/m → sec/km
+    else:
+        secs_per_km = 1000.0 / v      # m/s → sec/km
+    return f"{int(secs_per_km // 60)}:{int(secs_per_km % 60):02d} /km"
+
+
+def _normalize_step(step: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one Garmin workout step or repeat group to a readable dict.
+
+    Garmin's workout API uses:
+      - endCondition.conditionTypeKey  ("time", "distance", "lap.button")
+      - endConditionValue              (seconds or meters)
+      - stepType.stepTypeKey           ("warmup", "interval", "recovery", ...)
+      - targetType.workoutTargetTypeKey ("no.target", "heart.rate.zone",
+                                         "speed.zone", "power.zone", ...)
+      - targetValueOne / targetValueTwo (min/max of the target range)
+    """
+    step_type_str = step.get("type", "")
+    if "Repeat" in step_type_str or step.get("numberOfIterations"):
+        return {
+            "type": "repeat",
+            "iterations": step.get("numberOfIterations", 1),
+            "steps": [
+                _normalize_step(s)
+                for s in (step.get("workoutSteps") or [])
+                if isinstance(s, dict)
+            ],
+        }
+
+    # --- Duration ---
+    end_cond = step.get("endCondition") or {}
+    cond_key = (end_cond.get("conditionTypeKey") or "").lower() if isinstance(end_cond, dict) else ""
+    cond_value = step.get("endConditionValue")
+
+    # Flat-field fallback (older or alternative workout format)
+    if not cond_key:
+        raw_dur = step.get("durationType")
+        if isinstance(raw_dur, dict):
+            cond_key = (raw_dur.get("conditionTypeKey") or raw_dur.get("typeKey") or "").lower()
+        elif isinstance(raw_dur, str):
+            cond_key = raw_dur.lower()
+        if cond_value is None:
+            cond_value = step.get("durationValue")
+
+    if cond_key == "time" and isinstance(cond_value, (int, float)):
+        m, s = divmod(int(cond_value), 60)
+        duration: str | None = f"{m}:{s:02d} min"
+    elif cond_key == "distance" and isinstance(cond_value, (int, float)):
+        duration = f"{cond_value / 1000:.2f} km" if cond_value >= 1000 else f"{int(cond_value)} m"
+    elif cond_key in ("lap.button", "lap_button"):
+        duration = "lap button"
+    elif cond_key == "open":
+        duration = "open"
+    elif cond_key:
+        duration = f"{cond_key} {int(cond_value)}" if cond_value else cond_key
+    else:
+        duration = None
+
+    # --- Target ---
+    tgt_obj = step.get("targetType") or {}
+    tgt_key = ""
+    if isinstance(tgt_obj, dict):
+        # Garmin uses workoutTargetTypeKey in the step model
+        tgt_key = (
+            tgt_obj.get("workoutTargetTypeKey")
+            or tgt_obj.get("conditionTypeKey")
+            or tgt_obj.get("typeKey")
+            or ""
+        ).lower()
+    elif isinstance(tgt_obj, str):
+        tgt_key = tgt_obj.lower()
+
+    t1 = step.get("targetValueOne")
+    t2 = step.get("targetValueTwo")
+
+    target: str | None = None
+    if tgt_key in ("speed.zone", "speed", "pace"):
+        target = f"pace {_pace_str(t1)}" if _pace_str(t1) else "pace zone"
+        if _pace_str(t2) and isinstance(t2, (int, float)) and t2 != t1:
+            target = f"pace {_pace_str(t1)} – {_pace_str(t2)}"
+    elif tgt_key == "heart.rate.zone":
+        if isinstance(t1, (int, float)) and isinstance(t2, (int, float)):
+            target = f"HR {int(t1)}–{int(t2)} bpm"
+        elif isinstance(t1, (int, float)):
+            target = f"HR {int(t1)} bpm"
+        else:
+            target = "HR zone"
+    elif tgt_key == "power.zone":
+        if isinstance(t1, (int, float)) and isinstance(t2, (int, float)):
+            target = f"power {int(t1)}–{int(t2)} W"
+        elif isinstance(t1, (int, float)):
+            target = f"power {int(t1)} W"
+        else:
+            target = "power zone"
+    elif tgt_key == "cadence":
+        target = f"cadence {int(t1)} spm" if isinstance(t1, (int, float)) else "cadence zone"
+    elif tgt_key not in ("", "no.target", "open"):
+        target = str(tgt_key)
+
+    # Step label from stepType.stepTypeKey (e.g. "warmup", "interval")
+    step_type_obj = step.get("stepType") or {}
+    label = (step_type_obj.get("stepTypeKey") if isinstance(step_type_obj, dict) else None) or ""
+    if not label:
+        label = (step.get("intensity") or "step").lower()
+
+    return {
+        "type": label.lower(),
+        "description": step.get("description") or None,
+        "duration": duration,
+        "target": target,
+    }
+
+
+def _normalize_workout_summary(w: dict[str, Any]) -> dict[str, Any]:
+    sport = (w.get("sportType") or {}).get("sportTypeKey")
+    # Garmin uses different field names in list vs. detail responses.
+    secs = (
+        w.get("estimatedDurationInSecs")
+        or w.get("estimatedDuration")
+        or w.get("durationInSeconds")
+        or w.get("duration")
+        or 0
+    )
+    return {
+        "workout_id": w.get("workoutId"),
+        "name": w.get("workoutName"),
+        "sport": sport,
+        "estimated_duration_min": _round(secs / 60, 0) if secs else None,
+        "created": w.get("createdDate"),
+        "updated": w.get("updatedDate"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 9: get_workout_library
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_workout_library() -> dict[str, Any]:
+    """Structured workouts saved in the Garmin Connect workout library.
+
+    Returns a compact list of all saved workouts with:
+      - workout_id (pass to get_workout_detail for full step list)
+      - name, sport, estimated_duration_min
+
+    Covers all sports: running, cycling, swimming, strength, etc.
+    Use this to discover what structured sessions are available, then
+    call get_workout_detail() to see the step-by-step structure with
+    targets.
+    """
+    client = _get_client()
+    raw = _safe(lambda: client.get_workouts(0, 100), default=[]) or []
+    workouts = [_normalize_workout_summary(w) for w in raw if isinstance(w, dict)]
+    return {"count": len(workouts), "workouts": workouts}
+
+
+# ---------------------------------------------------------------------------
+# Tool 10: get_workout_detail
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_workout_detail(workout_id: int) -> dict[str, Any]:
+    """Step-by-step structure of a specific workout from the library.
+
+    Returns all segments and steps with:
+      - step type: warmup / active / rest / cooldown / repeat
+      - duration: time (m:ss) or distance (km / m)
+      - target: pace range, HR range, power range, or cadence
+      - description text
+
+    Get workout_id values from get_workout_library().
+    Use this to analyze the exact structure of a planned session, compare
+    a completed activity against the plan, or explain what each step requires.
+    """
+    client = _get_client()
+    raw = _safe(lambda: client.get_workout_by_id(workout_id))
+    if not isinstance(raw, dict):
+        return {"workout_id": workout_id, "error": "workout not found"}
+
+    sport = (raw.get("sportType") or {}).get("sportTypeKey")
+    secs = raw.get("estimatedDurationInSecs") or 0
+    segments: list[dict[str, Any]] = []
+    for seg in (raw.get("workoutSegments") or []):
+        if not isinstance(seg, dict):
+            continue
+        seg_sport = (seg.get("sportType") or {}).get("sportTypeKey")
+        steps = [
+            _normalize_step(s)
+            for s in (seg.get("workoutSteps") or [])
+            if isinstance(s, dict)
+        ]
+        segments.append({"sport": seg_sport, "steps": steps})
+
+    return {
+        "workout_id": workout_id,
+        "name": raw.get("workoutName"),
+        "sport": sport,
+        "estimated_duration_min": _round(secs / 60, 0) if secs else None,
+        "segments": segments,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 11: get_training_calendar
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_training_calendar(year: int = 0, month: int = 0) -> dict[str, Any]:
+    """Planned workouts scheduled on the Garmin Connect calendar for a month.
+
+    Defaults to the current month if year/month are 0.
+    Returns one entry per scheduled workout with:
+      - date, workout_id, name, sport, estimated_duration_min
+
+    Use this to see what's planned ahead, spot gaps, and align suggestions
+    with the existing schedule. Combine with get_workout_detail() to inspect
+    specific sessions.
+    """
+    today = date.today()
+    y = year if year > 0 else today.year
+    m = month if month > 0 else today.month
+
+    client = _get_client()
+    raw = _safe(lambda: client.get_scheduled_workouts(y, m))
+
+    items: list[Any] = []
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        for key in ("calendarItems", "scheduledWorkouts", "items"):
+            if key in raw and isinstance(raw[key], list):
+                items = raw[key]
+                break
+
+    entries: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        date_val = item.get("date") or item.get("calendarDate")
+        workout = item.get("workout") or item
+        secs = workout.get("estimatedDurationInSecs") or 0
+        entries.append({
+            "date": date_val,
+            "workout_id": workout.get("workoutId") or item.get("id"),
+            "name": workout.get("workoutName") or item.get("title"),
+            "sport": (workout.get("sportType") or {}).get("sportTypeKey") or item.get("sport"),
+            "estimated_duration_min": _round(secs / 60, 0) if secs else None,
+        })
+
+    entries.sort(key=lambda e: e.get("date") or "")
+    return {"year": y, "month": m, "count": len(entries), "scheduled": entries}
+
+
+# ---------------------------------------------------------------------------
+# Tool 12: get_training_plans_list
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_training_plans_list() -> dict[str, Any]:
+    """Training plans available or active in Garmin Connect.
+
+    Returns a list with:
+      - plan_id, name, status (active / completed / available)
+      - sport, total weeks, target event/distance
+
+    Use plan_id with get_training_plan_detail() to see the full
+    week-by-week structure and per-day workouts.
+    """
+    client = _get_client()
+    raw = _safe(lambda: client.get_training_plans())
+
+    items: list[Any] = []
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        for key in ("trainingPlanList", "plans", "items"):
+            if key in raw and isinstance(raw[key], list):
+                items = raw[key]
+                break
+
+    plans: list[dict[str, Any]] = []
+    for p in items:
+        if not isinstance(p, dict):
+            continue
+        plans.append({
+            "plan_id": p.get("trainingPlanId") or p.get("planId") or p.get("id"),
+            "name": p.get("trainingPlanName") or p.get("name"),
+            "status": p.get("trainingPlanStatus") or p.get("status"),
+            "sport": p.get("sportType") or p.get("sport"),
+            "weeks": p.get("numWeeks") or p.get("weeks"),
+            "target": p.get("targetGoal") or p.get("target"),
+        })
+
+    return {"count": len(plans), "plans": plans}
+
+
+# ---------------------------------------------------------------------------
+# Tool 13: get_training_plan_detail
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_training_plan_detail(plan_id: int) -> dict[str, Any]:
+    """Full week-by-week detail of a specific training plan.
+
+    Returns phases, weeks, and per-day workouts with name, sport,
+    estimated duration, and workout_id. Gives the complete roadmap
+    so Claude can advise on progression, recovery weeks, and alignment
+    with current training load.
+
+    Get plan_id from get_training_plans_list().
+    """
+    client = _get_client()
+    # _safe() re-raises GarminConnectConnectionError (which includes HTTP 400),
+    # so we need bare try/except here to fall through to the adaptive endpoint.
+    raw: dict[str, Any] | None = None
+    for fetch in [
+        lambda: client.get_training_plan_by_id(plan_id),
+        lambda: client.get_adaptive_training_plan_by_id(plan_id),
+    ]:
+        try:
+            result = fetch()
+            if isinstance(result, dict):
+                raw = result
+                break
+        except Exception:
+            continue
+    if raw is None:
+        return {"plan_id": plan_id, "error": "plan not found (tried both phased and adaptive endpoints)"}
+
+    def _parse_days(week_node: dict[str, Any]) -> list[dict[str, Any]]:
+        days: list[dict[str, Any]] = []
+        for day in (week_node.get("days") or week_node.get("trainingDays") or []):
+            if not isinstance(day, dict):
+                continue
+            wo = day.get("workout") or day
+            secs = wo.get("estimatedDurationInSecs") or wo.get("estimatedDuration") or 0
+            days.append({
+                "day": day.get("dayOfWeek") or day.get("day"),
+                "workout_name": wo.get("workoutName") or day.get("name"),
+                "sport": (wo.get("sportType") or {}).get("sportTypeKey") or day.get("sport"),
+                "estimated_duration_min": _round(secs / 60, 0) if secs else None,
+                "workout_id": wo.get("workoutId"),
+            })
+        return days
+
+    def _parse_weeks(nodes: list[Any]) -> list[dict[str, Any]]:
+        weeks: list[dict[str, Any]] = []
+        for week in nodes:
+            if not isinstance(week, dict):
+                continue
+            weeks.append({
+                "week": week.get("weekNumber") or week.get("week"),
+                "days": _parse_days(week),
+            })
+        return weeks
+
+    phases: list[dict[str, Any]] = []
+
+    # Try nested phases structure (phased plans)
+    phase_nodes = raw.get("phases") or raw.get("trainingPlanPhases") or []
+    for phase in phase_nodes:
+        if not isinstance(phase, dict):
+            continue
+        week_nodes = phase.get("weeks") or phase.get("trainingWeeks") or []
+        phases.append({
+            "phase": phase.get("phaseName") or phase.get("phase"),
+            "weeks": _parse_weeks(week_nodes),
+        })
+
+    # Adaptive/FBT plans use adaptivePlanPhases or planPhases at the top level
+    if not phases:
+        for phase_key in ("adaptivePlanPhases", "planPhases"):
+            phase_nodes = raw.get(phase_key) or []
+            if not isinstance(phase_nodes, list) or not phase_nodes:
+                continue
+            for phase in phase_nodes:
+                if not isinstance(phase, dict):
+                    continue
+                week_nodes = (
+                    phase.get("weeks")
+                    or phase.get("trainingWeeks")
+                    or phase.get("tasks")
+                    or []
+                )
+                phases.append({
+                    "phase": phase.get("trainingPhase") or phase.get("phaseName") or phase.get("name") or phase.get("phaseId"),
+                    "start_date": phase.get("startDate"),
+                    "end_date": phase.get("endDate"),
+                    "is_current": phase.get("currentPhase", False),
+                    "weeks": _parse_weeks(week_nodes),
+                })
+            if phases:
+                break
+
+    # Last resort: flat week list at top level
+    if not phases:
+        flat_weeks = raw.get("trainingWeeks") or raw.get("weeks") or raw.get("calendarItems") or []
+        if isinstance(flat_weeks, list) and flat_weeks:
+            phases = [{"phase": "Plan", "weeks": _parse_weeks(flat_weeks)}]
+
+    # taskList: flat list of dated tasks for adaptive/FBT plans.
+    # Always parsed when present. Field names confirmed from debug:
+    # taskWorkout (not workout), calendarDate, weekId, dayOfWeekId.
+    task_list_raw = raw.get("taskList") or []
+    task_list: list[dict[str, Any]] = []
+    for task in task_list_raw:
+        if not isinstance(task, dict):
+            continue
+        wo = task.get("taskWorkout") or task.get("workout") or {}
+        secs = (
+            wo.get("estimatedDurationInSecs")
+            or task.get("estimatedDurationInSecs")
+            or wo.get("estimatedDuration")
+            or 0
+        )
+        sport_obj = wo.get("sportType") or task.get("sportType") or {}
+        task_list.append({
+            "date": (
+                task.get("calendarDate") or task.get("scheduledDate")
+                or task.get("taskDate") or task.get("dueDate")
+            ),
+            "week_id": task.get("weekId"),
+            "day_of_week": task.get("dayOfWeekId"),
+            "type": task.get("taskType") or task.get("type"),
+            "workout_name": (
+                wo.get("workoutName") or task.get("workoutName")
+                or task.get("name") or task.get("title")
+            ),
+            "sport": (
+                (sport_obj.get("sportTypeKey") if isinstance(sport_obj, dict) else None)
+                or task.get("sport") or task.get("sportTypeKey")
+            ),
+            "estimated_duration_min": _round(secs / 60, 0) if secs else None,
+            "workout_id": wo.get("workoutId") or task.get("workoutId"),
+        })
+
+    return {
+        "plan_id": plan_id,
+        "name": raw.get("trainingPlanName") or raw.get("name"),
+        "sport": raw.get("sportType") or raw.get("sport"),
+        "total_weeks": (
+            raw.get("durationInWeeks") or raw.get("numWeeks")
+            or (len(phases[0]["weeks"]) if phases else None)
+        ),
+        "status": raw.get("trainingStatus") or raw.get("trainingPlanStatus") or raw.get("status"),
+        "start_date": raw.get("startDate"),
+        "end_date": raw.get("endDate"),
+        "phases": phases,
+        "task_list": task_list,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 14: get_lactate_threshold
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_lactate_threshold() -> dict[str, Any]:
+    """Lactate threshold: speed/power and heart rate at threshold intensity.
+
+    Returns:
+      - threshold_pace_min_km and threshold_hr_bpm (running)
+      - threshold_power_w and power_to_weight (cycling, if available)
+      - date of the last measurement
+
+    The lactate threshold is the highest intensity at which lactate
+    production and clearance balance. Use this to set accurate training
+    zones, verify FTP/LTHR, and anchor tempo/threshold workout targets.
+    Requires a compatible device with enough run/bike history.
+    """
+    client = _get_client()
+    raw = _safe(lambda: client.get_lactate_threshold())
+    if not isinstance(raw, dict):
+        return {"error": "lactate threshold data not available"}
+
+    shr = raw.get("speed_and_heart_rate") or {}
+    power_data = raw.get("power") or {}
+
+    pace: str | None = None
+    speed_raw = shr.get("speed")
+    if isinstance(speed_raw, (int, float)) and speed_raw > 0:
+        pace = _pace_str(speed_raw)  # handles both m/s and sec/m automatically
+
+    hr = shr.get("heartRate")
+    hr_bpm = int(hr) if isinstance(hr, (int, float)) else None
+
+    power_w = power_data.get("power") or power_data.get("functionalThresholdPower")
+    p2w = power_data.get("powerToWeightRatio") or power_data.get("value")
+
+    return {
+        "date": shr.get("calendarDate"),
+        "threshold_pace_min_km": pace,
+        "threshold_speed_raw": _round(speed_raw, 4) if isinstance(speed_raw, (int, float)) else None,
+        "threshold_hr_bpm": hr_bpm,
+        "threshold_hr_cycling_bpm": shr.get("heartRateCycling"),
+        "threshold_power_w": int(power_w) if isinstance(power_w, (int, float)) else None,
+        "power_to_weight_w_kg": _round(p2w, 2) if isinstance(p2w, (int, float)) else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 15: get_running_tolerance
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_running_tolerance(weeks: int = 4) -> dict[str, Any]:
+    """Weekly running tolerance: accumulated load vs. what your body can handle.
+
+    Garmin computes this from long-term running history. A high tolerance
+    means you can absorb more km without injury risk; low tolerance flags
+    overreach relative to your recent baseline.
+
+    Returns per-week data for the last `weeks` weeks:
+      - week_start, load, tolerance, status
+
+    Use this to spot overtraining risk in runners, especially when
+    mileage increases rapidly or after a layoff period.
+    """
+    end = date.today().isoformat()
+    start = (date.today() - timedelta(weeks=weeks)).isoformat()
+    client = _get_client()
+    raw = _safe(lambda: client.get_running_tolerance(start, end, "weekly"), default=[]) or []
+
+    entries: list[dict[str, Any]] = []
+    for item in (raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        entries.append({
+            "week_start": item.get("startDate") or item.get("calendarDate") or item.get("date"),
+            "load": _round(item.get("load") or item.get("runningLoad"), 1),
+            "tolerance": _round(item.get("tolerance") or item.get("runningTolerance"), 1),
+            "status": item.get("status") or item.get("runningToleranceStatus"),
+        })
+
+    return {"weeks": weeks, "data": entries}
+
+
+# ---------------------------------------------------------------------------
+# Tool 16: get_activity_zones
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_activity_zones(activity_id: int) -> dict[str, Any]:
+    """Heart rate and power zone distribution for a specific activity.
+
+    For each zone returns zone number, name, seconds and percentage of
+    time spent. For cycling with a power meter also returns power zones.
+
+    Pass an activity_id from get_activities(). Use this to verify that
+    an easy run was truly easy (most time in Z1-Z2), that an interval
+    session hit the right zones, or to analyze intensity distribution
+    for any session.
+    """
+    client = _get_client()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_hr = ex.submit(_safe, lambda: client.get_activity_hr_in_timezones(activity_id))
+        f_pw = ex.submit(_safe, lambda: client.get_activity_power_in_timezones(activity_id))
+        hr_raw = f_hr.result()
+        pw_raw = f_pw.result()
+
+    def _parse_zones(raw: Any) -> list[dict[str, Any]] | None:
+        if not raw:
+            return None
+        items = raw if isinstance(raw, list) else (raw.get("zones") or raw.get("timeInZones") or [])
+        if not items:
+            return None
+        total_secs = sum(
+            (z.get("secsInZone") or z.get("seconds") or z.get("timeInZone") or 0)
+            for z in items if isinstance(z, dict)
+        )
+        zones = []
+        for z in items:
+            if not isinstance(z, dict):
+                continue
+            secs = z.get("secsInZone") or z.get("seconds") or z.get("timeInZone") or 0
+            pct = _round(secs / total_secs * 100, 1) if total_secs else None
+            zones.append({
+                "zone": z.get("zoneNumber") or z.get("zone"),
+                "name": z.get("zoneName") or z.get("name"),
+                "seconds": int(secs),
+                "percent": pct,
+            })
+        return zones or None
+
+    hr_zones = _parse_zones(hr_raw)
+    pw_zones = _parse_zones(pw_raw)
+
+    if hr_zones is None and pw_zones is None:
+        return {"activity_id": activity_id, "error": "no zone data available for this activity"}
+    return {"activity_id": activity_id, "hr_zones": hr_zones, "power_zones": pw_zones}
+
+
+# ---------------------------------------------------------------------------
+# Tool 17: get_endurance_score
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_endurance_score() -> dict[str, Any]:
+    """Endurance score: overall aerobic capacity for sustained efforts.
+
+    Garmin's endurance score reflects long-duration aerobic performance,
+    complementing VO2max (which is peak aerobic power). A high score
+    means you can sustain effort over long durations efficiently.
+
+    Returns today's overall score plus run/bike sub-scores and the
+    qualifier label Garmin assigns. Requires a compatible device.
+    Use alongside VO2max for long-course triathlon and ultra-distance
+    capacity discussions.
+    """
+    client = _get_client()
+    today = _today_iso()
+    raw = _safe(lambda: client.get_endurance_score(today))
+
+    if isinstance(raw, list) and raw:
+        raw = raw[0] if isinstance(raw[0], dict) else None
+    if not isinstance(raw, dict):
+        return {"error": "endurance score not available (requires compatible device)"}
+
+    return {
+        "date": raw.get("calendarDate") or today,
+        "score": raw.get("overallEnduranceScore") or raw.get("score") or raw.get("value"),
+        "qualifier": raw.get("overallEnduranceQualifier") or raw.get("qualifier"),
+        "run_score": raw.get("runEnduranceScore") or raw.get("runScore"),
+        "bike_score": raw.get("bikeEnduranceScore") or raw.get("bikeScore"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 18: get_goals
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_goals(status: str = "active") -> dict[str, Any]:
+    """Goals set in Garmin Connect.
+
+    `status` must be one of: "active", "future", "past"
+
+    Each goal includes:
+      - type (distance / duration / steps / weight / etc.)
+      - target value, current value, completion percentage
+      - start and end dates
+
+    Use this to understand what the user is explicitly working toward
+    and align training suggestions with their stated objectives.
+    """
+    if status not in ("active", "future", "past"):
+        return {"error": f"invalid status '{status}'; use 'active', 'future', or 'past'"}
+
+    client = _get_client()
+    raw = _safe(lambda: client.get_goals(status=status), default=[]) or []
+
+    goals: list[dict[str, Any]] = []
+    for g in (raw if isinstance(raw, list) else []):
+        if not isinstance(g, dict):
+            continue
+        target = g.get("goalValue") or g.get("targetValue")
+        current = g.get("currentValue") or g.get("value")
+        pct = None
+        if isinstance(target, (int, float)) and isinstance(current, (int, float)) and target > 0:
+            pct = _round(min(current / target * 100, 100), 1)
+        goals.append({
+            "goal_id": g.get("id") or g.get("goalId"),
+            "type": g.get("goalType") or g.get("type"),
+            "description": g.get("goalName") or g.get("name") or g.get("description"),
+            "target": target,
+            "current": current,
+            "unit": g.get("unit") or g.get("unitKey"),
+            "completion_pct": pct,
+            "start_date": g.get("startDate"),
+            "end_date": g.get("endDate") or g.get("targetEndDate"),
+        })
+
+    return {"status": status, "count": len(goals), "goals": goals}
+
+
+# ---------------------------------------------------------------------------
+# Tool 19: get_progress_summary
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_progress_summary(days: int = 90, metric: str = "distance") -> dict[str, Any]:
+    """Historical training volume aggregated by sport type.
+
+    `metric` options:
+      - "distance"  → total km per sport
+      - "duration"  → total time (hours and minutes) per sport
+
+    Default window is 90 days (~one quarter). Use this for trend analysis:
+    how has volume evolved across swim/bike/run, or to compare sport
+    balance across periods.
+
+    Note: computed from individual activity records (Garmin's aggregation
+    endpoint is unreliable for some account types).
+    """
+    valid = {"distance", "duration"}
+    if metric not in valid:
+        return {"error": f"invalid metric '{metric}'; choose from {sorted(valid)}"}
+
+    client = _get_client()
+    activities = _fetch_recent_activities(client, days)
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for act in activities:
+        sport = act.get("sport") or "other"
+        if sport not in buckets:
+            buckets[sport] = {"sessions": 0, "distance_km": 0.0, "duration_min": 0.0}
+        b = buckets[sport]
+        b["sessions"] += 1
+        if isinstance(act.get("distance_km"), (int, float)):
+            b["distance_km"] += act["distance_km"]
+        if isinstance(act.get("duration_min"), (int, float)):
+            b["duration_min"] += act["duration_min"]
+
+    entries: list[dict[str, Any]] = []
+    for sport, b in sorted(buckets.items()):
+        if metric == "distance":
+            value = b["distance_km"]
+            display = f"{value:.1f} km"
+        else:
+            total_min = b["duration_min"]
+            h, m = divmod(int(total_min), 60)
+            value = total_min
+            display = f"{h}h {m:02d}m"
+        entries.append({
+            "sport": sport,
+            "sessions": b["sessions"],
+            "value_raw": _round(value, 2),
+            "value_display": display,
+        })
+
+    end = _today_iso()
+    start = (date.today() - timedelta(days=days)).isoformat()
+    return {
+        "period_days": days,
+        "metric": metric,
+        "start": start,
+        "end": end,
+        "total_activities": len(activities),
+        "by_sport": entries,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 20: get_gear
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_gear() -> dict[str, Any]:
+    """Registered gear (shoes, bikes) with total usage statistics.
+
+    For each item returns:
+      - name, type (shoes / bike / etc.)
+      - total_km and total_activities tracked by Garmin
+      - status (active / retired) and date added
+
+    Use this to check shoe mileage (typical replacement at 700–800 km),
+    compare equipment usage, or identify which gear is paired with which
+    activities.
+    """
+    client = _get_client()
+    # The /gear-service/gear/filterGear endpoint returns HTTP 500
+    # (IllegalArgumentException) for many account types — unusable.
+    # Instead, call get_activity_gear() on each recent activity and
+    # collect unique gear items from the responses.
+    activities = _fetch_recent_activities(client, 90)
+    seen: dict[str, dict[str, Any]] = {}
+    for act in activities[:40]:
+        act_id = act.get("activity_id")
+        if not act_id:
+            continue
+        try:
+            gear_raw = client.get_activity_gear(act_id)
+        except Exception:
+            continue
+        items = gear_raw if isinstance(gear_raw, list) else (
+            gear_raw.get("gear") or [] if isinstance(gear_raw, dict) else []
+        )
+        for g in items:
+            if not isinstance(g, dict):
+                continue
+            uuid = g.get("gearPk") or g.get("gearUUID") or g.get("uuid")
+            key = str(uuid) if uuid else (g.get("displayName") or g.get("customMakeModel") or "")
+            if key and key not in seen:
+                seen[key] = g
+
+    gear_list: list[dict[str, Any]] = []
+    for g in seen.values():
+        uuid = g.get("gearPk") or g.get("gearUUID") or g.get("uuid")
+        stats_raw = None
+        if uuid:
+            try:
+                stats_raw = client.get_gear_stats(uuid)
+            except Exception:
+                pass
+        total_m = None
+        total_activities = None
+        if isinstance(stats_raw, dict):
+            total_m = stats_raw.get("totalDistance") or stats_raw.get("distance")
+            total_activities = stats_raw.get("totalActivities") or stats_raw.get("activities")
+        gear_list.append({
+            "name": g.get("displayName") or g.get("customMakeModel") or g.get("name"),
+            "type": g.get("gearTypeName") or g.get("gearType") or g.get("type"),
+            "uuid": uuid,
+            "total_km": _round(total_m / 1000, 1) if isinstance(total_m, (int, float)) else None,
+            "total_activities": int(total_activities) if isinstance(total_activities, (int, float)) else None,
+            "status": g.get("gearStatusName") or g.get("status"),
+            "date_begin": g.get("dateBegin") or g.get("beginDate"),
+        })
+
+    return {
+        "count": len(gear_list),
+        "gear": gear_list,
+        "source": "inferred from recent activities (last 90 days)",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
