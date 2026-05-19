@@ -196,10 +196,19 @@ BIKE_TYPES = {
     "e_bike_fitness",
 }
 RUN_TYPES = {"running", "treadmill_running", "trail_running", "track_running", "virtual_run"}
+STRENGTH_TYPES = {"strength_training", "indoor_climbing", "bouldering"}
+MINDFULNESS_TYPES = {"yoga", "pilates", "meditation", "breathwork", "mindfulness"}
+HIIT_TYPES = {"hiit", "cardio", "indoor_cardio", "fitness_equipment"}
+WALK_TYPES = {"walking", "indoor_walking", "hiking"}
+OTHER_TYPES = {"other", "elliptical", "stair_climbing", "rowing", "indoor_rowing"}
 
 
 def _bucket(type_key: str | None) -> str | None:
-    """Map a Garmin activity typeKey to a coarse sport bucket (swim/bike/run)."""
+    """Map a Garmin activity typeKey to a coarse sport bucket.
+
+    Returns one of: swim, bike, run, strength, mindfulness, hiit, walk, other.
+    Returns None only if the type_key is missing entirely.
+    """
     if not type_key:
         return None
     if type_key in SWIM_TYPES:
@@ -208,7 +217,15 @@ def _bucket(type_key: str | None) -> str | None:
         return "bike"
     if type_key in RUN_TYPES:
         return "run"
-    return None
+    if type_key in STRENGTH_TYPES:
+        return "strength"
+    if type_key in MINDFULNESS_TYPES:
+        return "mindfulness"
+    if type_key in HIIT_TYPES:
+        return "hiit"
+    if type_key in WALK_TYPES:
+        return "walk"
+    return "other"
 
 
 # ---------------------------------------------------------------------------
@@ -596,14 +613,17 @@ def get_recent_load(days: int = 28) -> dict[str, Any]:
 
 @mcp.tool()
 def get_activities(days: int = 14) -> dict[str, Any]:
-    """List recent multisport activities with normalized details.
+    """List recent activities of every sport with normalized details.
 
-    Filtered to swim/bike/run only. Each activity includes:
-      - sport, date, duration_min, distance_km
-      - hr_avg, hr_max
+    Covers swim/bike/run AND strength, yoga, mindfulness, HIIT, walk, etc.
+    Each activity includes:
+      - sport (swim/bike/run/strength/mindfulness/hiit/walk/other), date,
+        duration_min, distance_km (when applicable), hr_avg, hr_max
       - pace_min_km (run), avg_power_w / normalized_power_w (bike),
         total_strokes / avg_stroke_distance_m (swim)
-      - activity_id (use with get_running_dynamics for deep run analysis)
+      - activity_id (use with get_running_dynamics, get_strength_session,
+        get_swim_session, get_bike_session, get_mindfulness_session,
+        or get_intervals_session for deep per-sport analysis)
 
     Default window is 14 days. Use this to discuss specific recent
     sessions or to find an activity_id for further analysis.
@@ -1762,6 +1782,512 @@ def get_gear() -> dict[str, Any]:
         "gear": gear_list,
         "source": "inferred from recent activities (last 90 days)",
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool 21: get_strength_session
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_strength_session(activity_id: int) -> dict[str, Any]:
+    """Detailed set-by-set breakdown of a strength training session.
+
+    Returns per-set: exercise name and category, reps, weight (kg),
+    duration. Plus aggregated stats: total active sets, total reps,
+    total volume (kg lifted), per-exercise breakdown with set count,
+    max weight, and average reps.
+
+    Use this when the user asks about a specific strength workout —
+    bodyweight circuits, gym sessions, weighted exercises. Get the
+    activity_id from get_activities(), filtering by sport='strength'
+    or activity_type containing 'strength_training'.
+    """
+    client = _get_client()
+    raw = _safe(lambda: client.get_activity_exercise_sets(activity_id))
+    if not isinstance(raw, dict):
+        return {"activity_id": activity_id, "error": "no exercise set data for this activity"}
+
+    sets_raw = raw.get("exerciseSets") or raw.get("sets") or []
+    if not isinstance(sets_raw, list) or not sets_raw:
+        return {
+            "activity_id": activity_id,
+            "error": "this activity has no recorded exercise sets (not a strength session, or the device didn't capture sets)",
+        }
+
+    # Per-exercise aggregation: keyed by "category|name" so different
+    # exercises in the same category stay distinct.
+    by_exercise: dict[str, dict[str, Any]] = {}
+    set_list: list[dict[str, Any]] = []
+    total_active = 0
+    total_rest = 0
+    total_reps = 0
+    total_volume_kg = 0.0
+
+    for i, s in enumerate(sets_raw, start=1):
+        if not isinstance(s, dict):
+            continue
+        set_type = (s.get("setType") or "").upper()
+        is_active = set_type == "ACTIVE"
+        is_rest = set_type == "REST"
+        if is_active:
+            total_active += 1
+        elif is_rest:
+            total_rest += 1
+
+        # Exercise metadata (only present on active sets, typically)
+        exercises = s.get("exercises") or []
+        ex_obj = exercises[0] if isinstance(exercises, list) and exercises else {}
+        category = ex_obj.get("category") if isinstance(ex_obj, dict) else None
+        name = ex_obj.get("name") if isinstance(ex_obj, dict) else None
+
+        # Reps and weight
+        reps = s.get("repetitionCount") or s.get("repCount") or s.get("reps")
+        # Weight in grams (Garmin internal unit). Convert to kg.
+        weight_g = s.get("weight")
+        weight_kg = _round(weight_g / 1000, 1) if isinstance(weight_g, (int, float)) else None
+        duration_sec = s.get("duration")
+
+        if is_active:
+            if isinstance(reps, (int, float)):
+                total_reps += int(reps)
+                if isinstance(weight_kg, (int, float)) and weight_kg > 0:
+                    total_volume_kg += float(reps) * float(weight_kg)
+
+            ex_key = f"{category or 'UNKNOWN'}|{name or 'UNKNOWN'}"
+            agg = by_exercise.setdefault(ex_key, {
+                "category": category,
+                "name": name,
+                "sets": 0,
+                "total_reps": 0,
+                "max_weight_kg": None,
+                "all_reps": [],
+            })
+            agg["sets"] += 1
+            if isinstance(reps, (int, float)):
+                agg["total_reps"] += int(reps)
+                agg["all_reps"].append(int(reps))
+            if isinstance(weight_kg, (int, float)) and weight_kg > 0:
+                if agg["max_weight_kg"] is None or weight_kg > agg["max_weight_kg"]:
+                    agg["max_weight_kg"] = weight_kg
+
+        set_list.append({
+            "order": i,
+            "type": set_type.lower() if set_type else None,
+            "exercise": name,
+            "category": category,
+            "reps": int(reps) if isinstance(reps, (int, float)) else None,
+            "weight_kg": weight_kg,
+            "duration_sec": _round(duration_sec, 1) if isinstance(duration_sec, (int, float)) else None,
+        })
+
+    # Finalize per-exercise breakdown
+    exercises_summary = []
+    for agg in by_exercise.values():
+        all_reps = agg.pop("all_reps")
+        agg["avg_reps"] = _round(sum(all_reps) / len(all_reps), 1) if all_reps else None
+        exercises_summary.append(agg)
+    exercises_summary.sort(key=lambda e: e["sets"], reverse=True)
+
+    return {
+        "activity_id": activity_id,
+        "total_sets": total_active + total_rest,
+        "active_sets": total_active,
+        "rest_sets": total_rest,
+        "total_reps": total_reps,
+        "total_volume_kg": _round(total_volume_kg, 1) if total_volume_kg else None,
+        "unique_exercises": len(exercises_summary),
+        "exercises": exercises_summary,
+        "set_list": set_list,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 22: get_swim_session
+# ---------------------------------------------------------------------------
+
+def _format_time(secs: Any) -> str | None:
+    """Format seconds as M:SS or H:MM:SS."""
+    if not isinstance(secs, (int, float)) or secs < 0:
+        return None
+    s = int(secs)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+@mcp.tool()
+def get_swim_session(activity_id: int) -> dict[str, Any]:
+    """Lap-by-lap detail of a swim session: stroke type, SWOLF, strokes.
+
+    For pool swims, returns per-length data (each pool length). For open
+    water, returns per-lap data. Each entry has stroke type (freestyle,
+    backstroke, breaststroke, butterfly, drill, mixed), distance,
+    duration, stroke count, and SWOLF (time + strokes — lower is better).
+
+    Aggregates: total distance, total strokes, dominant stroke type,
+    avg SWOLF, pool length.
+
+    Use this when the user asks about a specific swim workout. Get the
+    activity_id from get_activities() filtering by sport='swim'.
+    """
+    client = _get_client()
+    summary = _safe(lambda: client.get_activity(activity_id)) or {}
+    splits = _safe(lambda: client.get_activity_splits(activity_id)) or {}
+
+    if not isinstance(summary, dict):
+        summary = {}
+    if not isinstance(splits, dict):
+        splits = {}
+
+    summary_dto = summary.get("summaryDTO") or summary.get("summary") or {}
+    pool_length = summary_dto.get("poolLength")
+    total_distance = summary_dto.get("distance")
+    total_duration = summary_dto.get("duration") or summary_dto.get("movingDuration")
+
+    lap_nodes = splits.get("lapDTOs") or splits.get("laps") or []
+    stroke_counts: dict[str, int] = {}
+    swolf_values: list[float] = []
+    total_strokes = 0
+    laps_out: list[dict[str, Any]] = []
+
+    for i, lap in enumerate(lap_nodes, start=1):
+        if not isinstance(lap, dict):
+            continue
+        stroke = (
+            lap.get("swimStroke") or lap.get("stroke")
+            or (lap.get("strokeType") or {}).get("strokeTypeKey")
+            if isinstance(lap.get("strokeType"), dict) else lap.get("strokeType")
+        )
+        if isinstance(stroke, str):
+            stroke_counts[stroke] = stroke_counts.get(stroke, 0) + 1
+        strokes = lap.get("totalStrokes") or lap.get("strokes")
+        swolf = lap.get("swolf") or lap.get("avgSwolf")
+        dur = lap.get("duration") or lap.get("movingDuration")
+        dist = lap.get("distance")
+        if isinstance(strokes, (int, float)):
+            total_strokes += int(strokes)
+        if isinstance(swolf, (int, float)) and swolf > 0:
+            swolf_values.append(float(swolf))
+
+        laps_out.append({
+            "lap": i,
+            "stroke": stroke,
+            "distance_m": _round(dist, 1) if isinstance(dist, (int, float)) else None,
+            "duration": _format_time(dur),
+            "strokes": int(strokes) if isinstance(strokes, (int, float)) else None,
+            "swolf": int(swolf) if isinstance(swolf, (int, float)) else None,
+        })
+
+    dominant_stroke = max(stroke_counts.items(), key=lambda x: x[1])[0] if stroke_counts else None
+    avg_swolf = _round(sum(swolf_values) / len(swolf_values), 1) if swolf_values else None
+
+    pace_per_100m = None
+    if isinstance(total_distance, (int, float)) and total_distance > 0 and isinstance(total_duration, (int, float)):
+        secs_per_100 = (total_duration / total_distance) * 100
+        pace_per_100m = f"{int(secs_per_100 // 60)}:{int(secs_per_100 % 60):02d} /100m"
+
+    return {
+        "activity_id": activity_id,
+        "pool_length_m": _round(pool_length, 1) if isinstance(pool_length, (int, float)) else None,
+        "total_distance_m": _round(total_distance, 0) if isinstance(total_distance, (int, float)) else None,
+        "total_duration": _format_time(total_duration),
+        "total_strokes": total_strokes or None,
+        "avg_pace_per_100m": pace_per_100m,
+        "avg_swolf": avg_swolf,
+        "dominant_stroke": dominant_stroke,
+        "stroke_breakdown": stroke_counts or None,
+        "lap_count": len(laps_out),
+        "laps": laps_out,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 23: get_bike_session
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_bike_session(activity_id: int) -> dict[str, Any]:
+    """Detailed power and zone breakdown of a cycling session.
+
+    Returns:
+      - power metrics: avg, max, normalized power (NP), intensity factor (IF),
+        training stress score (TSS)
+      - cadence: avg, max
+      - HR zones: time-in-zone distribution (seconds per zone)
+      - Power zones: time-in-zone distribution (seconds per zone)
+      - elevation, distance, duration
+
+    Use this for analyzing bike workouts when the user asks about power,
+    zones, NP/IF, or wants to evaluate intensity. Get the activity_id
+    from get_activities() filtering by sport='bike'.
+    """
+    client = _get_client()
+    summary_raw = _safe(lambda: client.get_activity(activity_id)) or {}
+    hr_zones = _safe(lambda: client.get_activity_hr_in_timezones(activity_id))
+    power_zones = _safe(lambda: client.get_activity_power_in_timezones(activity_id))
+
+    if not isinstance(summary_raw, dict):
+        summary_raw = {}
+    s = summary_raw.get("summaryDTO") or summary_raw.get("summary") or {}
+
+    def _zones_to_dict(zones: Any) -> dict[str, int] | None:
+        if not isinstance(zones, list) or not zones:
+            return None
+        out: dict[str, int] = {}
+        for z in zones:
+            if not isinstance(z, dict):
+                continue
+            zn = z.get("zoneNumber") or z.get("zone") or z.get("number")
+            secs = z.get("secsInZone") or z.get("timeInZone") or z.get("seconds")
+            if zn is not None and isinstance(secs, (int, float)):
+                out[f"zone_{zn}"] = int(secs)
+        return out or None
+
+    return {
+        "activity_id": activity_id,
+        "distance_km": _round(s.get("distance") / 1000, 2) if isinstance(s.get("distance"), (int, float)) else None,
+        "duration": _format_time(s.get("duration") or s.get("movingDuration")),
+        "elevation_gain_m": _round(s.get("elevationGain"), 0) if isinstance(s.get("elevationGain"), (int, float)) else None,
+        "avg_power_w": _round(s.get("averagePower"), 0) if isinstance(s.get("averagePower"), (int, float)) else None,
+        "max_power_w": _round(s.get("maxPower"), 0) if isinstance(s.get("maxPower"), (int, float)) else None,
+        "normalized_power_w": _round(s.get("normPower") or s.get("normalizedPower"), 0)
+            if isinstance(s.get("normPower") or s.get("normalizedPower"), (int, float)) else None,
+        "intensity_factor": _round(s.get("intensityFactor"), 2) if isinstance(s.get("intensityFactor"), (int, float)) else None,
+        "training_stress_score": _round(s.get("trainingStressScore"), 1) if isinstance(s.get("trainingStressScore"), (int, float)) else None,
+        "avg_cadence_rpm": _round(s.get("averageBikeCadence") or s.get("averageCadence"), 0)
+            if isinstance(s.get("averageBikeCadence") or s.get("averageCadence"), (int, float)) else None,
+        "max_cadence_rpm": _round(s.get("maxBikeCadence") or s.get("maxCadence"), 0)
+            if isinstance(s.get("maxBikeCadence") or s.get("maxCadence"), (int, float)) else None,
+        "avg_hr_bpm": _round(s.get("averageHR"), 0) if isinstance(s.get("averageHR"), (int, float)) else None,
+        "max_hr_bpm": _round(s.get("maxHR"), 0) if isinstance(s.get("maxHR"), (int, float)) else None,
+        "hr_time_in_zones_sec": _zones_to_dict(hr_zones),
+        "power_time_in_zones_sec": _zones_to_dict(power_zones),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 24: get_mindfulness_session
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_mindfulness_session(activity_id: int) -> dict[str, Any]:
+    """Detail of a yoga, meditation, or breathwork session.
+
+    Returns:
+      - activity_type (yoga, meditation, breathwork, pilates, mindfulness)
+      - duration
+      - avg/min/max HR
+      - avg respiration rate
+      - stress level (if tracked)
+      - HRV change (if available)
+      - calories
+
+    Use this for recovery-oriented sessions when the user asks about
+    yoga/meditation effectiveness, stress management, or mind-body
+    workouts. Get the activity_id from get_activities() filtering by
+    sport in {'yoga', 'meditation', 'breathwork', 'pilates'}.
+    """
+    client = _get_client()
+    raw = _safe(lambda: client.get_activity(activity_id)) or {}
+    if not isinstance(raw, dict):
+        return {"activity_id": activity_id, "error": "no data for this activity"}
+
+    s = raw.get("summaryDTO") or raw.get("summary") or {}
+    activity_type = (
+        (raw.get("activityTypeDTO") or {}).get("typeKey")
+        or raw.get("activityType")
+        or (s.get("activityType") if isinstance(s.get("activityType"), str) else None)
+    )
+
+    return {
+        "activity_id": activity_id,
+        "activity_type": activity_type,
+        "name": raw.get("activityName"),
+        "start_time": _parse_local(raw.get("startTimeLocal") or s.get("startTimeLocal")),
+        "duration": _format_time(s.get("duration") or s.get("movingDuration")),
+        "calories": int(s.get("calories")) if isinstance(s.get("calories"), (int, float)) else None,
+        "avg_hr_bpm": _round(s.get("averageHR"), 0) if isinstance(s.get("averageHR"), (int, float)) else None,
+        "min_hr_bpm": _round(s.get("minHR"), 0) if isinstance(s.get("minHR"), (int, float)) else None,
+        "max_hr_bpm": _round(s.get("maxHR"), 0) if isinstance(s.get("maxHR"), (int, float)) else None,
+        "avg_respiration_rate": _round(s.get("avgRespirationRate"), 1)
+            if isinstance(s.get("avgRespirationRate"), (int, float)) else None,
+        "min_respiration_rate": _round(s.get("minRespirationRate"), 1)
+            if isinstance(s.get("minRespirationRate"), (int, float)) else None,
+        "max_respiration_rate": _round(s.get("maxRespirationRate"), 1)
+            if isinstance(s.get("maxRespirationRate"), (int, float)) else None,
+        "avg_stress_level": _round(s.get("averageStress") or s.get("avgStress"), 0)
+            if isinstance(s.get("averageStress") or s.get("avgStress"), (int, float)) else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 25: get_intervals_session
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_intervals_session(activity_id: int) -> dict[str, Any]:
+    """Lap-by-lap breakdown for HIIT, cardio, or any interval-based session.
+
+    Works on any activity type with lap structure: HIIT, treadmill
+    intervals, cardio circuits, structured workouts. Returns per-lap:
+    duration, distance, avg HR, max HR, avg pace (if applicable),
+    intensity type (active / rest if detected).
+
+    Aggregates: total laps, active laps, rest laps, avg HR overall,
+    estimated work-to-rest ratio.
+
+    Use this when the user asks about an interval session or wants
+    to see how the intervals were executed. Get the activity_id from
+    get_activities().
+    """
+    client = _get_client()
+    splits = _safe(lambda: client.get_activity_splits(activity_id)) or {}
+    summary = _safe(lambda: client.get_activity(activity_id)) or {}
+
+    if not isinstance(splits, dict):
+        splits = {}
+    lap_nodes = splits.get("lapDTOs") or splits.get("laps") or []
+
+    laps_out: list[dict[str, Any]] = []
+    active_laps = 0
+    rest_laps = 0
+    active_duration = 0.0
+    rest_duration = 0.0
+    hr_sum = 0.0
+    hr_count = 0
+
+    for i, lap in enumerate(lap_nodes, start=1):
+        if not isinstance(lap, dict):
+            continue
+        intensity_type = (lap.get("intensityType") or "").upper() or None
+        # Garmin marks intervals as ACTIVE/REST/WARMUP/COOLDOWN
+        is_active = intensity_type in {"ACTIVE", "WARMUP", "COOLDOWN"} or not intensity_type
+        is_rest = intensity_type == "REST" or intensity_type == "RECOVERY"
+        if is_rest:
+            rest_laps += 1
+        else:
+            active_laps += 1
+        dur = lap.get("duration") or lap.get("movingDuration")
+        dist = lap.get("distance")
+        avg_hr = lap.get("averageHR")
+        max_hr = lap.get("maxHR")
+        if isinstance(dur, (int, float)):
+            if is_rest:
+                rest_duration += float(dur)
+            else:
+                active_duration += float(dur)
+        if isinstance(avg_hr, (int, float)) and avg_hr > 0:
+            hr_sum += float(avg_hr)
+            hr_count += 1
+
+        avg_speed = lap.get("averageSpeed")
+        pace = _pace_str(avg_speed) if isinstance(avg_speed, (int, float)) else None
+
+        laps_out.append({
+            "lap": i,
+            "type": intensity_type.lower() if intensity_type else "active",
+            "distance_m": _round(dist, 1) if isinstance(dist, (int, float)) else None,
+            "duration": _format_time(dur),
+            "avg_hr_bpm": _round(avg_hr, 0) if isinstance(avg_hr, (int, float)) else None,
+            "max_hr_bpm": _round(max_hr, 0) if isinstance(max_hr, (int, float)) else None,
+            "avg_pace": pace,
+        })
+
+    work_to_rest = None
+    if rest_duration > 0:
+        work_to_rest = _round(active_duration / rest_duration, 2)
+
+    return {
+        "activity_id": activity_id,
+        "activity_type": (summary.get("activityTypeDTO") or {}).get("typeKey")
+            if isinstance(summary, dict) else None,
+        "lap_count": len(laps_out),
+        "active_laps": active_laps,
+        "rest_laps": rest_laps,
+        "active_duration": _format_time(active_duration) if active_duration else None,
+        "rest_duration": _format_time(rest_duration) if rest_duration else None,
+        "work_to_rest_ratio": work_to_rest,
+        "avg_hr_overall_bpm": _round(hr_sum / hr_count, 0) if hr_count else None,
+        "laps": laps_out,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 26: get_full_snapshot
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_full_snapshot(activity_days: int = 14, load_days: int = 28) -> dict[str, Any]:
+    """ONE-CALL comprehensive Garmin data dump for holistic analysis.
+
+    Fetches every important metric in parallel and returns a single
+    object with the complete picture: recovery, fitness markers, training
+    load, recent activities (every sport), volume by sport, stress,
+    zones, scores, race predictions, lactate threshold, training plans,
+    and personal records.
+
+    Use this when the user asks for a complete analysis, a holistic
+    overview, "everything you know about my training", or anything that
+    would otherwise require calling 10+ tools. Saves round-trips and
+    gives Claude the full context in one shot.
+
+    Args:
+      activity_days: window for recent_activities (default 14)
+      load_days: window for recent_load by sport (default 28)
+
+    Failures in individual sections do not break the snapshot — each
+    section is returned with whatever data was retrievable, or null
+    if the section failed entirely.
+    """
+    # Pre-warm the client so every parallel call reuses the same one
+    # without racing on the lazy init.
+    _get_client()
+
+    sections: dict[str, Callable[[], Any]] = {
+        "recovery": lambda: get_recovery(),
+        "fitness": lambda: get_fitness(),
+        "training_load": lambda: get_training_load(),
+        "recent_load": lambda: get_recent_load(load_days),
+        "recent_activities": lambda: get_activities(activity_days),
+        "stress": lambda: get_stress_data(7),
+        "personal_records": lambda: get_personal_records(),
+        "hr_zones": lambda: get_hr_zones(),
+        "power_zones": lambda: get_power_zones(),
+        "endurance_score": lambda: get_endurance_score(),
+        "hill_score": lambda: get_hill_score(),
+        "race_predictions": lambda: get_race_predictions(),
+        "training_effect": lambda: get_training_effect(),
+        "lactate_threshold": lambda: get_lactate_threshold(),
+        "training_plans": lambda: get_training_plans_list(),
+        "progress_summary": lambda: get_progress_summary(90, "distance"),
+    }
+
+    # Moderate parallelism to avoid Garmin rate limits (429).
+    # Each underlying tool already parallelizes its own internal calls.
+    results: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {name: ex.submit(_safe_section, fn) for name, fn in sections.items()}
+        for name, fut in futures.items():
+            results[name] = fut.result()
+
+    return {
+        "snapshot_date": _today_iso(),
+        "activity_window_days": activity_days,
+        "load_window_days": load_days,
+        **results,
+    }
+
+
+def _safe_section(fn: Callable[[], Any]) -> Any:
+    """Run a tool function, returning {'error': ...} on any failure.
+
+    Used by get_full_snapshot so a single failing section doesn't
+    poison the whole snapshot.
+    """
+    try:
+        return fn()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 # ---------------------------------------------------------------------------
