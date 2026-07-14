@@ -58,6 +58,44 @@ log = logging.getLogger("garmin-mcp")
 # (turns "C:\Users\me/.garminconnect" into "C:\Users\me\.garminconnect").
 TOKEN_STORE = os.path.normpath(os.path.expanduser("~/.garminconnect"))
 
+# Token files garminconnect/garth may write inside TOKEN_STORE. Current
+# garminconnect (0.3.x) uses a single garmin_tokens.json; the oauth*.json
+# names are the legacy garth layout, cleared defensively.
+_TOKEN_CACHE_FILES = ("garmin_tokens.json", "oauth1_token.json", "oauth2_token.json")
+
+# Exception class name garminconnect raises when Garmin rejects
+# authentication. Matched by name to avoid eager-importing garminconnect
+# at module top (keeps server startup light).
+_AUTH_ERROR_NAMES = {"GarminConnectAuthenticationError"}
+
+
+def _token_cache_present() -> bool:
+    """True if any cached Garmin token file exists in TOKEN_STORE."""
+    return any(
+        os.path.isfile(os.path.join(TOKEN_STORE, name))
+        for name in _TOKEN_CACHE_FILES
+    )
+
+
+def _clear_token_cache() -> None:
+    """Delete cached Garmin OAuth tokens so the next login re-authenticates.
+
+    When the cached access token has expired and the refresh token is no
+    longer valid, garminconnect's login() reuses the dead tokens and the
+    first authenticated API call returns 401 — surfaced as a misleading
+    "credentials rejected" auth error rather than a clean fall-back to a
+    fresh SSO login. Clearing the cache forces that fresh login.
+    """
+    for name in _TOKEN_CACHE_FILES:
+        path = os.path.join(TOKEN_STORE, name)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                log.info("Cleared stale Garmin token cache: %s", path)
+        except OSError as e:
+            log.warning("Could not remove token cache %s: %s", path, e)
+
+
 mcp = FastMCP("garmin")
 
 # Cached Garmin client. Built on first tool invocation, then reused.
@@ -88,6 +126,34 @@ def _build_client(allow_interactive_mfa: bool) -> Any:
     )
 
 
+def _login_with_recovery(allow_interactive_mfa: bool) -> Any:
+    """Authenticate, self-healing past a stale token cache.
+
+    Tries a normal login (which reuses cached tokens when present). If
+    Garmin rejects the cached tokens with an auth error AND a cache
+    exists, clears the cache and retries a single fresh login. Returns
+    the authenticated client, or raises the underlying exception (real
+    bad credentials, MFA-required, rate-limit, etc.) for the caller to
+    format.
+    """
+    client = _build_client(allow_interactive_mfa=allow_interactive_mfa)
+    try:
+        client.login(TOKEN_STORE)
+        return client
+    except Exception as e:
+        if type(e).__name__ not in _AUTH_ERROR_NAMES or not _token_cache_present():
+            raise
+        log.warning(
+            "Cached Garmin tokens rejected (%s); clearing cache and "
+            "retrying a fresh login",
+            type(e).__name__,
+        )
+        _clear_token_cache()
+        client = _build_client(allow_interactive_mfa=allow_interactive_mfa)
+        client.login(TOKEN_STORE)  # fresh SSO; raises on real bad creds/MFA
+        return client
+
+
 def _get_client() -> Any:
     """Return an authenticated Garmin client, reusing cached tokens.
 
@@ -102,15 +168,16 @@ def _get_client() -> Any:
     if _client is not None:
         return _client
 
-    client = _build_client(allow_interactive_mfa=False)
     try:
-        client.login(TOKEN_STORE)
+        # Self-heals past a stale token cache (expired access token +
+        # dead refresh token), which otherwise surfaces as a bogus 401.
+        client = _login_with_recovery(allow_interactive_mfa=False)
     except Exception as e:
         # Distinguish bad credentials from expired/missing tokens by
         # inspecting the exception class name (avoids eager-importing
         # garminconnect just for the isinstance check).
         cls_name = type(e).__name__
-        if cls_name == "GarminConnectAuthenticationError":
+        if cls_name in _AUTH_ERROR_NAMES:
             raise RuntimeError(
                 "Garmin authentication failed - your email or password "
                 "in .env is wrong. Edit .env and run: "
@@ -2304,12 +2371,15 @@ def _interactive_login() -> None:
     """
     print("Garmin Connect login...", file=sys.stderr)
     try:
-        client = _build_client(allow_interactive_mfa=True)
-        client.login(TOKEN_STORE)
+        # Self-heals past a stale token cache: if the cached tokens are
+        # rejected, the cache is cleared and a fresh SSO login is retried.
+        # Without this, re-running `login` kept reading the same dead
+        # cache and failing with a bogus 401 — the exact trap users hit.
+        _login_with_recovery(allow_interactive_mfa=True)
     except Exception as e:
         # Catch by class name to avoid eager-importing garminconnect at the top
         cls_name = type(e).__name__
-        if cls_name == "GarminConnectAuthenticationError":
+        if cls_name in _AUTH_ERROR_NAMES:
             print("", file=sys.stderr)
             print("ERROR: Garmin rejected your credentials (401 Unauthorized).", file=sys.stderr)
             print("       Edit the .env file with the correct email/password and re-run:", file=sys.stderr)
