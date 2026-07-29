@@ -347,7 +347,7 @@ def get_recovery() -> dict[str, Any]:
             "level": item.get("level"),
             "feedback_short": item.get("feedbackShort"),
             "feedback_long": item.get("feedbackLong"),
-            "recovery_time_hours": item.get("recoveryTime"),
+            "recovery_time_minutes": item.get("recoveryTime"),
             "sleep_score": item.get("sleepScore"),
             "hrv_weekly_avg": item.get("hrvWeeklyAverage"),
         }
