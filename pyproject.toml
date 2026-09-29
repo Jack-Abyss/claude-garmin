@@ -1,0 +1,18 @@
+[project]
+name = "claude-garmin"
+version = "1.0.0"
+description = "Garmin Connect MCP server for Claude Desktop"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+# Keep in sync with requirements.txt (used by the script-based installer).
+dependencies = [
+    "mcp>=1.2,<2",
+    "garminconnect>=0.2.20,<1",
+    "curl_cffi>=0.7,<1",
+    "python-dotenv>=1.0,<2",
+]
+
+[tool.uv]
+# Plain script, not an installable package: uv only needs to resolve deps.
+package = false

@@ -1,0 +1,18 @@
+# Keep the .mcpb bundle to what the server needs at runtime.
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.example
+*.mcpb
+uv.lock
+scripts/
+install.bat
+install.ps1
+uninstall.bat
+uninstall.ps1
+test_tools.py
+requirements.txt

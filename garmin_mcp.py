@@ -102,12 +102,16 @@ mcp = FastMCP("garmin")
 _client: Any = None
 
 
-def _build_client(allow_interactive_mfa: bool) -> Any:
+def _build_client(allow_interactive_mfa: bool, return_on_mfa: bool = False) -> Any:
     """Construct a Garmin client from env credentials.
 
     `allow_interactive_mfa=True` is only safe when running from a real
     terminal (the `login` subcommand). Under the MCP runtime, stdin is
     owned by the protocol — prompting would corrupt the JSON-RPC stream.
+
+    `return_on_mfa=True` makes login() stop at the MFA step instead of
+    prompting, so the code can be supplied later via resume_login() —
+    this is how the `garmin_login` tool does MFA through the chat.
     """
     from garminconnect import Garmin  # lazy import
 
@@ -116,13 +120,15 @@ def _build_client(allow_interactive_mfa: bool) -> Any:
     if not email or not password:
         raise RuntimeError(
             "GARMIN_EMAIL and GARMIN_PASSWORD are not set. "
-            "Define them in the .env file or as environment variables "
-            "(under the 'env' key in claude_desktop_config.json)."
+            "Set them in the extension settings (Claude Desktop → Settings → "
+            "Extensions → Garmin Connect), or in the .env file for a "
+            "script-based install."
         )
     return Garmin(
         email=email,
         password=password,
         prompt_mfa=(lambda: input("MFA code: ")) if allow_interactive_mfa else None,
+        return_on_mfa=return_on_mfa,
     )
 
 
@@ -162,7 +168,7 @@ def _get_client() -> Any:
 
     MFA is intentionally disabled here: if the cached tokens are missing
     or expired, the call fails fast with an actionable error pointing
-    the user at `python garmin_mcp.py login`.
+    at the `garmin_login` tool (or `python garmin_mcp.py login`).
     """
     global _client
     if _client is not None:
@@ -179,15 +185,15 @@ def _get_client() -> Any:
         cls_name = type(e).__name__
         if cls_name in _AUTH_ERROR_NAMES:
             raise RuntimeError(
-                "Garmin authentication failed - your email or password "
-                "in .env is wrong. Edit .env and run: "
-                "`python garmin_mcp.py login` "
-                f"(or use install.bat -Reconfigure). Original error: {e}"
+                "Garmin login needed - either this is the first use, the "
+                "saved session expired, the account has MFA enabled, or "
+                "the email/password are wrong. Call the `garmin_login` "
+                "tool to sign in (it handles MFA codes). "
+                f"Original error: {e}"
             ) from e
         raise RuntimeError(
             "Garmin login failed - cached tokens are likely missing or "
-            "expired. Run this once in a terminal: "
-            "`python garmin_mcp.py login` "
+            "expired. Call the `garmin_login` tool to sign in again "
             f"(original error: {e})"
         ) from e
     _client = client
@@ -293,6 +299,97 @@ def _bucket(type_key: str | None) -> str | None:
     if type_key in WALK_TYPES:
         return "walk"
     return "other"
+
+
+# ---------------------------------------------------------------------------
+# Tool 0: garmin_login (first-time setup / session renewal, MFA-aware)
+# ---------------------------------------------------------------------------
+
+# Client holding a half-finished SSO login while we wait for the user's MFA
+# code. garminconnect keeps the MFA state on the client object itself, so
+# the same instance must survive between the two garmin_login() calls.
+_pending_mfa_client: Any = None
+
+
+@mcp.tool()
+def garmin_login(mfa_code: str = "") -> dict[str, Any]:
+    """Sign in to Garmin Connect. Needed once after install, and again only
+    if Garmin expires the saved session (typically after months).
+
+    Call this when another garmin tool fails with a login/authentication
+    error, or when the user asks to connect or re-connect Garmin.
+
+    Two-step flow for accounts with MFA (2FA):
+      1. Call with no arguments. If the result has status "mfa_required",
+         Garmin has just sent a code (email/SMS/authenticator app).
+      2. Ask the user for that code, then call again with mfa_code="123456".
+
+    Credentials come from the extension settings, never from the chat.
+    """
+    global _client, _pending_mfa_client
+
+    code = (mfa_code or "").strip()
+    if code:
+        if _pending_mfa_client is None:
+            return {
+                "status": "error",
+                "message": "No login is waiting for an MFA code. Call "
+                           "garmin_login() without arguments first.",
+            }
+        try:
+            _pending_mfa_client.resume_login(None, code)
+            _pending_mfa_client.client.dump(TOKEN_STORE)
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"MFA code rejected or expired ({type(e).__name__}: "
+                           f"{e}). Ask the user to double-check it and retry, "
+                           "or call garmin_login() without arguments to have "
+                           "Garmin send a new code.",
+            }
+        _pending_mfa_client = None
+    else:
+        # Already signed in with working tokens: nothing to do.
+        if _client is not None:
+            return {"status": "ok", "message": "Already signed in to Garmin Connect."}
+        if _token_cache_present():
+            try:
+                _get_client()
+                return {"status": "ok", "message": "Already signed in to Garmin Connect."}
+            except Exception:
+                pass  # dead tokens: fall through to a fresh SSO login
+        _clear_token_cache()
+        _pending_mfa_client = None
+        try:
+            client = _build_client(allow_interactive_mfa=False, return_on_mfa=True)
+            mfa_status, _ = client.login(TOKEN_STORE)
+        except Exception as e:
+            if type(e).__name__ in _AUTH_ERROR_NAMES:
+                return {
+                    "status": "error",
+                    "message": "Garmin rejected the email/password. Fix them in "
+                               "Claude Desktop → Settings → Extensions → Garmin "
+                               f"Connect, then retry. ({e})",
+                }
+            return {"status": "error", "message": f"{type(e).__name__}: {e}"}
+        if mfa_status == "needs_mfa":
+            _pending_mfa_client = client
+            return {
+                "status": "mfa_required",
+                "message": "Garmin sent a verification code. Ask the user for "
+                           "it, then call garmin_login(mfa_code=\"<code>\").",
+            }
+        # In return_on_mfa mode garminconnect stops before persisting tokens.
+        client.client.dump(TOKEN_STORE)
+
+    # Rebuild from the freshly saved tokens so the profile is loaded exactly
+    # as on a normal startup.
+    _client = None
+    try:
+        _get_client()
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    return {"status": "ok", "message": f"Signed in. Tokens saved in {TOKEN_STORE}."}
 
 
 # ---------------------------------------------------------------------------

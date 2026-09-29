@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey.svg)](#)
+[![Platform: Windows | macOS](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey.svg)](#install-in-one-click-windows--macos)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
 > **Garmin Connect for Claude Desktop** — an MCP connector that brings your Garmin data into Claude, so you can chat about your training and get personalized plans, recovery checks, and session analyses grounded in your **real** numbers.
@@ -34,7 +34,29 @@ In short: if you don't open Claude Desktop, nothing is running.
 
 ---
 
-## Quick install (automated script)
+## Install in one click (Windows & macOS)
+
+The connector ships as a **Claude Desktop extension** (`.mcpb` file). Claude Desktop takes care of Python and all dependencies for you — no terminal, no scripts.
+
+1. Install [Claude Desktop](https://claude.ai/download) (if you don't have it yet) and sign in.
+2. Download **`claude-garmin.mcpb`** from the latest **[Release](https://github.com/Jack-Abyss/claude-garmin/releases/latest)**.
+3. **Double-click** the file (or drag it onto the Claude Desktop window, or go to **Settings → Extensions → Install Extension…**).
+4. Click **Install**, then enter your **Garmin Connect email and password** when asked. The password is stored by Claude Desktop in your OS keychain and is only ever sent to Garmin.
+5. Start a new chat and say: **"Sign me in to Garmin"**.
+   - If your Garmin account has **MFA (2FA)** enabled, Garmin sends you a code and Claude asks you for it — just type it in the chat.
+   - This happens **once**: the session is saved in `~/.garminconnect/` and refreshed automatically for months.
+6. Try: *"How's my recovery today?"*
+
+> The first start after install can take up to a minute while Claude Desktop downloads the dependencies. Later starts are instant.
+
+**Update**: download the new `.mcpb` from Releases and double-click it again.
+**Uninstall**: Claude Desktop → **Settings → Extensions → Garmin Connect → Uninstall**. To also delete the saved Garmin session, remove the `.garminconnect` folder in your home directory.
+
+---
+
+## Alternative: script installer (Windows only)
+
+Use this only if you can't use the extension (e.g. an older Claude Desktop without extension support).
 
 1. Download the zip from the **[Releases](https://github.com/Jack-Abyss/claude-garmin/releases)** page (or `git clone`) and extract it wherever you like.
 2. **Double-click `install.bat`**.
@@ -305,7 +327,8 @@ The connector exposes 8 tools that are individually cheap to call (~0.5-3s each)
 - If something is wrong: `.\install.bat -Reconfigure` redoes the setup.
 
 **"Garmin login failed... cached tokens are missing or expired"**
-- Run `python garmin_mcp.py login` again from PowerShell. Tokens expire every few months or if Garmin invalidates the session.
+- Extension install: ask Claude *"Sign me in to Garmin"* (it calls the `garmin_login` tool; MFA codes go in the chat).
+- Script install: run `python garmin_mcp.py login` again from PowerShell. Tokens expire every few months or if Garmin invalidates the session.
 
 **Lots of `null` values in `get_recovery` / `get_training_load`**
 - Advanced metrics (training readiness, HRV, training load, body battery) require compatible devices: Forerunner 255 / 265 / 955 / 965, Fenix 6 Pro+, Venu 2+, Epix, etc. Older devices don't compute them, so Garmin simply doesn't have the data — the connector returns `null` faithfully.
@@ -361,6 +384,16 @@ winget uninstall Anthropic.Claude
 
 ---
 
+## Releasing a new version (maintainers)
+
+1. Bump `version` in **both** `manifest.json` and `pyproject.toml` (CI fails if they differ).
+2. If you add or rename a tool, update the `tools` list in `manifest.json` (`python scripts/check_manifest.py` catches drift).
+3. Push a tag: `git tag v1.2.3 && git push origin v1.2.3`. The **Build Claude Desktop extension** workflow packs `claude-garmin.mcpb` and attaches it to the GitHub Release.
+
+To build locally: `npx @anthropic-ai/mcpb pack . claude-garmin.mcpb`
+
+---
+
 ## Tech stack
 
 - Python 3.11+
@@ -376,7 +409,7 @@ The server runs **only locally** on your PC, over stdio. No Garmin data leaves y
 ## Contributing
 
 Issues and pull requests welcome. Areas of interest:
-- macOS / Linux support (the installer is Windows-only for now; the Python server itself is cross-platform)
+- Testing the `.mcpb` extension on more Claude Desktop versions / platforms (Linux)
 - Additional tools (sleep details, hydration, women's health metrics, swim-specific dynamics)
 - Pinning more activity type keys in the swim/bike/run buckets
 
