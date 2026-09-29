@@ -14,3 +14,5 @@ __pycache__/
 # Local scan/test scratch files
 _scan_*.py
 _scan_*.ps1
+*.mcpb
+uv.lock

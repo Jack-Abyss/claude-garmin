@@ -1,0 +1,82 @@
+{
+  "manifest_version": "0.4",
+  "name": "claude-garmin",
+  "display_name": "Garmin Connect",
+  "version": "1.0.0",
+  "description": "Your real Garmin Connect data in Claude: recovery, HRV, training load, activities, fitness markers, workouts and more.",
+  "long_description": "Brings your Garmin Connect data into Claude so training plans, recovery checks and session analyses are grounded in your real numbers.\n\nAfter installing, ask Claude: \"Sign me in to Garmin\". If your account uses MFA (2FA), Claude will ask you for the code Garmin sends you. This is needed only once: the session is saved on your computer and refreshed automatically for months.\n\nThe server runs only on your computer. Your password is stored by Claude Desktop in the OS keychain and sent only to Garmin.",
+  "author": {
+    "name": "Jack-Abyss",
+    "url": "https://github.com/Jack-Abyss"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jack-Abyss/claude-garmin"
+  },
+  "homepage": "https://github.com/Jack-Abyss/claude-garmin",
+  "support": "https://github.com/Jack-Abyss/claude-garmin/issues",
+  "server": {
+    "type": "uv",
+    "entry_point": "garmin_mcp.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "garmin_mcp.py"],
+      "env": {
+        "GARMIN_EMAIL": "${user_config.garmin_email}",
+        "GARMIN_PASSWORD": "${user_config.garmin_password}"
+      }
+    }
+  },
+  "user_config": {
+    "garmin_email": {
+      "type": "string",
+      "title": "Garmin Connect email",
+      "description": "The email you use to sign in to Garmin Connect.",
+      "required": true
+    },
+    "garmin_password": {
+      "type": "string",
+      "title": "Garmin Connect password",
+      "description": "Stored securely by Claude Desktop and sent only to Garmin.",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "tools": [
+    {"name": "garmin_login", "description": "Sign in to Garmin Connect (first use / expired session), MFA-aware"},
+    {"name": "get_recovery", "description": "Training readiness, HRV, sleep, body battery, resting HR"},
+    {"name": "get_fitness", "description": "VO2max, cycling FTP, race predictions"},
+    {"name": "get_recent_load", "description": "Training load aggregated by sport"},
+    {"name": "get_activities", "description": "Recent activities with normalized details"},
+    {"name": "get_running_dynamics", "description": "Running form metrics for a run"},
+    {"name": "get_training_load", "description": "Acute/chronic load, ratio, focus breakdown"},
+    {"name": "get_stress_data", "description": "Daily stress levels"},
+    {"name": "get_personal_records", "description": "Personal records by sport"},
+    {"name": "get_workout_library", "description": "Saved structured workouts"},
+    {"name": "get_workout_detail", "description": "Step-by-step structure of a workout"},
+    {"name": "get_training_calendar", "description": "Planned workouts for a month"},
+    {"name": "get_training_plans_list", "description": "Available or active training plans"},
+    {"name": "get_training_plan_detail", "description": "Week-by-week training plan detail"},
+    {"name": "get_lactate_threshold", "description": "Lactate threshold speed/power and HR"},
+    {"name": "get_running_tolerance", "description": "Weekly running tolerance"},
+    {"name": "get_activity_zones", "description": "HR and power zone distribution for an activity"},
+    {"name": "get_endurance_score", "description": "Endurance score"},
+    {"name": "get_goals", "description": "Goals set in Garmin Connect"},
+    {"name": "get_progress_summary", "description": "Historical volume by sport"},
+    {"name": "get_gear", "description": "Shoes and bikes with usage stats"},
+    {"name": "get_strength_session", "description": "Set-by-set strength session breakdown"},
+    {"name": "get_swim_session", "description": "Lap-by-lap swim detail"},
+    {"name": "get_bike_session", "description": "Power and zone breakdown of a ride"},
+    {"name": "get_mindfulness_session", "description": "Yoga, meditation, breathwork detail"},
+    {"name": "get_intervals_session", "description": "Lap-by-lap interval session breakdown"},
+    {"name": "get_full_snapshot", "description": "One-call comprehensive data dump"}
+  ],
+  "keywords": ["garmin", "fitness", "training", "running", "cycling", "triathlon", "health"],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  }
+}
