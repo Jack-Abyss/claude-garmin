@@ -37,12 +37,12 @@ load_dotenv()
 
 # Defensive: if the .env file was saved with a UTF-8 BOM (PowerShell 5.1's
 # Set-Content -Encoding utf8 does this), python-dotenv reads the first key
-# as "﻿GARMIN_EMAIL" instead of "GARMIN_EMAIL", making it invisible to
+# as "\ufeffGARMIN_EMAIL" instead of "GARMIN_EMAIL", making it invisible to
 # os.environ.get("GARMIN_EMAIL"). Alias any BOM-prefixed keys to their
 # clean counterparts so the rest of the code can stay BOM-agnostic.
 for _key in list(os.environ.keys()):
-    if _key.startswith("﻿"):
-        os.environ.setdefault(_key.lstrip("﻿"), os.environ[_key])
+    if _key.startswith("\ufeff"):
+        os.environ.setdefault(_key.lstrip("\ufeff"), os.environ[_key])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -235,6 +235,12 @@ def _round(value: Any, ndigits: int = 2) -> Any:
         return round(float(value), ndigits)
     except (TypeError, ValueError):
         return None
+
+
+def _put(out: dict[str, Any], key: str, value: Any) -> None:
+    """Set `out[key]` only when value is not None (keeps output compact)."""
+    if value is not None:
+        out[key] = value
 
 
 def _parse_local(ts: str | None) -> str | None:
@@ -541,8 +547,9 @@ def get_fitness() -> dict[str, Any]:
 def _normalize_activity(activity: dict[str, Any]) -> dict[str, Any] | None:
     """Convert a raw Garmin activity into a clean, sport-aware dict.
 
-    Returns None for sports outside swim/bike/run (we focus on multisport
-    endurance: a yoga session or a strength workout is filtered out).
+    Returns None only if the activity has no type key at all.
+    Optional fields (elevation, training effect, power, ...) are only
+    included when Garmin actually reports them.
     """
     type_key = (activity.get("activityType") or {}).get("typeKey")
     sport = _bucket(type_key)
@@ -565,6 +572,17 @@ def _normalize_activity(activity: dict[str, Any]) -> dict[str, Any] | None:
         "hr_max": int(hr_max) if isinstance(hr_max, (int, float)) else None,
     }
 
+    # --- Elevation (all sports; Garmin activity list reports meters) ---
+    _put(out, "elevation_gain_m", _round(activity.get("elevationGain"), 0))
+    _put(out, "elevation_loss_m", _round(activity.get("elevationLoss"), 0))
+    _put(out, "elevation_min_m", _round(activity.get("minElevation"), 0))
+    _put(out, "elevation_max_m", _round(activity.get("maxElevation"), 0))
+
+    # --- Training effect / load (all sports) ---
+    _put(out, "te_aerobic", _round(activity.get("aerobicTrainingEffect"), 1))
+    _put(out, "te_anaerobic", _round(activity.get("anaerobicTrainingEffect"), 1))
+    _put(out, "training_load", _round(activity.get("activityTrainingLoad"), 0))
+
     if sport == "run":
         avg_speed_mps = activity.get("averageSpeed")
         if isinstance(avg_speed_mps, (int, float)) and avg_speed_mps > 0:
@@ -578,6 +596,23 @@ def _normalize_activity(activity: dict[str, Any]) -> dict[str, Any] | None:
         )
         if isinstance(cadence, (int, float)):
             out["cadence_spm"] = _round(cadence, 0)
+
+        max_speed = activity.get("maxSpeed")
+        if isinstance(max_speed, (int, float)) and max_speed > 0:
+            out["best_pace_min_km"] = _mps_to_pace(max_speed)
+        gap = activity.get("avgGradeAdjustedSpeed")
+        if isinstance(gap, (int, float)) and gap > 0:
+            out["gap_pace_min_km"] = _mps_to_pace(gap)
+
+        _put(out, "avg_power_w", _round(activity.get("avgPower"), 0))
+        _put(out, "max_power_w", _round(activity.get("maxPower"), 0))
+        _put(out, "avg_respiration_brpm", _round(activity.get("avgRespirationRate"), 0))
+        _put(out, "max_respiration_brpm", _round(activity.get("maxRespirationRate"), 0))
+        _put(out, "temp_min_c", _round(activity.get("minTemperature"), 0))
+        _put(out, "temp_max_c", _round(activity.get("maxTemperature"), 0))
+        # Key names unverified – check raw JSON if these stay empty
+        _put(out, "stamina_start_pct", _round(activity.get("beginPotentialStamina"), 0))
+        _put(out, "stamina_end_pct", _round(activity.get("endPotentialStamina"), 0))
 
     if sport == "bike":
         avg_power = activity.get("avgPower") or activity.get("averagePower")
@@ -686,8 +721,15 @@ def get_activities(days: int = 14) -> dict[str, Any]:
     Each activity includes:
       - sport (swim/bike/run/strength/mindfulness/hiit/walk/other), date,
         duration_min, distance_km (when applicable), hr_avg, hr_max
-      - pace_min_km (run), avg_power_w / normalized_power_w (bike),
-        total_strokes / avg_stroke_distance_m (swim)
+      - elevation_gain_m, elevation_loss_m, elevation_min_m,
+        elevation_max_m, te_aerobic, te_anaerobic, training_load
+        (all sports, when reported)
+      - run: pace_min_km, cadence_spm, best_pace_min_km,
+        gap_pace_min_km (grade-adjusted), avg_power_w, max_power_w,
+        avg/max_respiration_brpm, temp_min_c/temp_max_c,
+        stamina_start_pct/stamina_end_pct
+      - bike: avg_power_w / normalized_power_w
+      - swim: total_strokes / avg_stroke_distance_m
       - activity_id (use with get_running_dynamics, get_strength_session,
         get_swim_session, get_bike_session, get_mindfulness_session,
         or get_intervals_session for deep per-sport analysis)
@@ -712,7 +754,9 @@ def get_running_dynamics(activity_id: int) -> dict[str, Any]:
       - cadence_spm (steps per minute)
       - ground_contact_time_ms
       - vertical_oscillation_cm
+      - vertical_ratio_pct
       - stride_length_m
+      - run_time / walk_time (Garmin run/walk detection)
 
     These metrics need an HRM-Pro/HRM-Run strap, a foot pod, or a watch
     with onboard running dynamics. If the activity wasn't a run or no
@@ -756,9 +800,15 @@ def get_running_dynamics(activity_id: int) -> dict[str, Any]:
         )
         gct = summary.get("groundContactTime") or summary.get("avgGroundContactTime")
         vertical = summary.get("verticalOscillation") or summary.get("avgVerticalOscillation")
-        stride = summary.get("avgStrideLength") or summary.get("averageStrideLength")
+        # summaryDTO uses "strideLength"; the activity list uses "avgStrideLength"
+        stride = (
+            summary.get("strideLength")
+            or summary.get("avgStrideLength")
+            or summary.get("averageStrideLength")
+        )
+        vratio = summary.get("verticalRatio") or summary.get("avgVerticalRatio")
     else:
-        cadence = gct = vertical = stride = None
+        cadence = gct = vertical = stride = vratio = None
 
     # Garmin reports stride length in cm in most endpoints — convert to meters.
     # If the raw value is suspiciously small (<5) we assume it's already meters.
@@ -770,6 +820,19 @@ def get_running_dynamics(activity_id: int) -> dict[str, Any]:
     if isinstance(vertical, (int, float)):
         vertical_oscillation_cm = _round(vertical, 1)
 
+    # Run/walk split (Garmin auto-detects running vs. walking segments)
+    run_s: Any = None
+    walk_s: Any = None
+    split_sum = _safe(lambda: client.get_activity_split_summaries(activity_id)) or {}
+    split_items = split_sum.get("splitSummaries") or [] if isinstance(split_sum, dict) else []
+    for s in split_items:
+        if not isinstance(s, dict):
+            continue
+        if s.get("splitType") == "RWD_RUN":
+            run_s = s.get("duration")
+        elif s.get("splitType") == "RWD_WALK":
+            walk_s = s.get("duration")
+
     return {
         "activity_id": activity_id,
         "sport": sport,
@@ -777,7 +840,10 @@ def get_running_dynamics(activity_id: int) -> dict[str, Any]:
         "cadence_spm": _round(cadence, 0) if isinstance(cadence, (int, float)) else None,
         "ground_contact_time_ms": _round(gct, 0) if isinstance(gct, (int, float)) else None,
         "vertical_oscillation_cm": vertical_oscillation_cm,
+        "vertical_ratio_pct": _round(vratio, 1) if isinstance(vratio, (int, float)) else None,
         "stride_length_m": stride_m,
+        "run_time": _format_time(run_s),
+        "walk_time": _format_time(walk_s),
     }
 
 
@@ -2196,16 +2262,17 @@ def get_intervals_session(activity_id: int) -> dict[str, Any]:
     """Lap-by-lap breakdown for HIIT, cardio, or any interval-based session.
 
     Works on any activity type with lap structure: HIIT, treadmill
-    intervals, cardio circuits, structured workouts. Returns per-lap:
-    duration, distance, avg HR, max HR, avg pace (if applicable),
-    intensity type (active / rest if detected).
+    intervals, cardio circuits, structured workouts, auto-lap runs.
+    Returns per-lap: duration, distance, avg HR, max HR, avg pace
+    (if applicable), elevation gain/loss, intensity type (active / rest
+    if detected).
 
     Aggregates: total laps, active laps, rest laps, avg HR overall,
     estimated work-to-rest ratio.
 
     Use this when the user asks about an interval session or wants
-    to see how the intervals were executed. Get the activity_id from
-    get_activities().
+    to see how the intervals were executed, or to see per-km climbing
+    on a trail run. Get the activity_id from get_activities().
     """
     client = _get_client()
     splits = _safe(lambda: client.get_activity_splits(activity_id)) or {}
@@ -2258,6 +2325,8 @@ def get_intervals_session(activity_id: int) -> dict[str, Any]:
             "avg_hr_bpm": _round(avg_hr, 0) if isinstance(avg_hr, (int, float)) else None,
             "max_hr_bpm": _round(max_hr, 0) if isinstance(max_hr, (int, float)) else None,
             "avg_pace": pace,
+            "elevation_gain_m": _round(lap.get("elevationGain"), 0),
+            "elevation_loss_m": _round(lap.get("elevationLoss"), 0),
         })
 
     work_to_rest = None
@@ -2288,10 +2357,10 @@ def get_full_snapshot(activity_days: int = 14, load_days: int = 28) -> dict[str,
     """ONE-CALL comprehensive Garmin data dump for holistic analysis.
 
     Fetches every important metric in parallel and returns a single
-    object with the complete picture: recovery, fitness markers, training
-    load, recent activities (every sport), volume by sport, stress,
-    zones, scores, race predictions, lactate threshold, training plans,
-    and personal records.
+    object with the complete picture: recovery, fitness markers (incl.
+    race predictions), training load, recent activities (every sport),
+    volume by sport, stress, endurance score, lactate threshold,
+    training plans, and personal records.
 
     Use this when the user asks for a complete analysis, a holistic
     overview, "everything you know about my training", or anything that
@@ -2310,6 +2379,10 @@ def get_full_snapshot(activity_days: int = 14, load_days: int = 28) -> dict[str,
     # without racing on the lazy init.
     _get_client()
 
+    # Note: get_hr_zones / get_power_zones / get_hill_score /
+    # get_race_predictions / get_training_effect were referenced here
+    # but never defined (NameError). Removed; race predictions are
+    # already part of get_fitness().
     sections: dict[str, Callable[[], Any]] = {
         "recovery": lambda: get_recovery(),
         "fitness": lambda: get_fitness(),
@@ -2318,12 +2391,7 @@ def get_full_snapshot(activity_days: int = 14, load_days: int = 28) -> dict[str,
         "recent_activities": lambda: get_activities(activity_days),
         "stress": lambda: get_stress_data(7),
         "personal_records": lambda: get_personal_records(),
-        "hr_zones": lambda: get_hr_zones(),
-        "power_zones": lambda: get_power_zones(),
         "endurance_score": lambda: get_endurance_score(),
-        "hill_score": lambda: get_hill_score(),
-        "race_predictions": lambda: get_race_predictions(),
-        "training_effect": lambda: get_training_effect(),
         "lactate_threshold": lambda: get_lactate_threshold(),
         "training_plans": lambda: get_training_plans_list(),
         "progress_summary": lambda: get_progress_summary(90, "distance"),
